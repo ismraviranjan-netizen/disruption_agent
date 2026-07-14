@@ -8,7 +8,7 @@ that monitors inventory, detects stockout risk, and proposes
 in plain English for a business audience.
 
 RUN IT:
-    pip install streamlit openai pandas
+    pip install streamlit openai pandas plotly
     export OPENAI_API_KEY=sk-...   (or paste key in the sidebar)
     streamlit run hackathon_agent.py
 
@@ -26,6 +26,7 @@ import math
 import os
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from openai import OpenAI
 
@@ -41,6 +42,13 @@ DISTANCES_KM = {
     ("Delhi", "Mumbai"): 1400, ("Delhi", "Bangalore"): 2150,
     ("Delhi", "Kolkata"): 1500, ("Mumbai", "Bangalore"): 980,
     ("Mumbai", "Kolkata"): 1900, ("Bangalore", "Kolkata"): 1870,
+}
+
+WAREHOUSE_COORDS = {
+    "Delhi": (28.61, 77.21),
+    "Mumbai": (19.08, 72.88),
+    "Bangalore": (12.97, 77.59),
+    "Kolkata": (22.57, 88.36),
 }
 
 
@@ -79,6 +87,99 @@ def with_cover(df: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     )
     return out
+
+
+def inventory_map(df: pd.DataFrame, last_transfer: dict | None = None) -> go.Figure:
+    """Map warehouse health and, when available, the most recent transfer."""
+    view = with_cover(df)
+    status_rank = {"OK": 0, "WATCH": 1, "AT RISK": 2}
+    status_color = {"OK": "green", "WATCH": "yellow", "AT RISK": "red"}
+
+    cities = []
+    colors = []
+    hover_text = []
+    for city, (lat, lon) in WAREHOUSE_COORDS.items():
+        city_rows = view[view["location"] == city]
+        statuses = [
+            next((label for label in status_rank if str(value).endswith(label)), "OK")
+            for value in city_rows["status"]
+        ]
+        worst_status = max(statuses, key=status_rank.get) if statuses else "OK"
+        sku_lines = [
+            f"{row.sku}: {int(row.on_hand):,} units, {row.days_of_cover:.1f} days cover"
+            for row in city_rows.itertuples()
+        ]
+        cities.append((city, lat, lon))
+        colors.append(status_color[worst_status])
+        hover_text.append(
+            f"<b>{city}</b><br>Worst status: {worst_status}<br>" + "<br>".join(sku_lines)
+        )
+
+    fig = go.Figure()
+    fig.add_trace(go.Scattergeo(
+        lat=[lat for _, lat, _ in cities],
+        lon=[lon for _, _, lon in cities],
+        text=[city for city, _, _ in cities],
+        customdata=hover_text,
+        hovertemplate="%{customdata}<extra></extra>",
+        mode="markers+text",
+        textposition="top center",
+        marker=dict(size=15, color=colors, line=dict(color="white", width=1.5)),
+        name="Warehouses",
+    ))
+
+    if last_transfer:
+        source = WAREHOUSE_COORDS.get(last_transfer["from"])
+        destination = WAREHOUSE_COORDS.get(last_transfer["to"])
+        if source and destination:
+            src_lat, src_lon = source
+            dst_lat, dst_lon = destination
+            fig.add_trace(go.Scattergeo(
+                lat=[src_lat, dst_lat],
+                lon=[src_lon, dst_lon],
+                mode="lines",
+                line=dict(color="blue", width=3, dash="dash"),
+                hoverinfo="skip",
+                name=f"Last transfer: {last_transfer['qty']:,} {last_transfer['sku']}",
+            ))
+            arrow_fraction = 0.88
+            arrow_lat = src_lat + (dst_lat - src_lat) * arrow_fraction
+            arrow_lon = src_lon + (dst_lon - src_lon) * arrow_fraction
+            fig.add_trace(go.Scattergeo(
+                lat=[src_lat, arrow_lat],
+                lon=[src_lon, arrow_lon],
+                mode="markers",
+                marker=dict(
+                    size=[0, 13],
+                    color="blue",
+                    symbol="triangle-up",
+                    angleref="previous",
+                ),
+                text=["", (
+                    f"{last_transfer['sku']}: {last_transfer['qty']:,} units"
+                    f"<br>{last_transfer['from']} to {last_transfer['to']}"
+                )],
+                hovertemplate="%{text}<extra></extra>",
+                showlegend=False,
+            ))
+
+    fig.update_layout(
+        height=420,
+        margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(orientation="h", y=0.01, x=0.01),
+        geo=dict(
+            projection_type="mercator",
+            lataxis=dict(range=[6, 36]),
+            lonaxis=dict(range=[66, 98]),
+            showland=True,
+            landcolor="#f3f4f6",
+            showocean=True,
+            oceancolor="#eaf4fb",
+            showcountries=True,
+            countrycolor="#9ca3af",
+        ),
+    )
+    return fig
 
 
 # ------------------------------------------------------------------
@@ -130,7 +231,8 @@ def tool_transfer_stock(df: pd.DataFrame, sku: str, from_location: str,
         return {"ok": False,
                 "error": f"Transfer would breach safety stock at {src.location}. Max transferable: {max_q} units."}
 
-    dist = distance_km(src.location, df[mask_to].iloc[0].location)
+    destination = df[mask_to].iloc[0]
+    dist = distance_km(src.location, destination.location)
     cost_inr = round(quantity * (dist / 1000) * 2.0)      # ₹2 per unit per 1000 km (demo math)
     eta_days = math.ceil(dist / 500)                       # truck @ ~500 km/day
 
@@ -138,6 +240,12 @@ def tool_transfer_stock(df: pd.DataFrame, sku: str, from_location: str,
     df.loc[mask_from, "on_hand"] -= quantity
     df.loc[mask_to, "on_hand"] += quantity
     st.session_state.inv = df
+    st.session_state.last_transfer = {
+        "sku": sku,
+        "from": src.location,
+        "to": destination.location,
+        "qty": quantity,
+    }
 
     return {"ok": True, "sku": sku, "from": from_location, "to": to_location,
             "quantity": quantity, "estimated_cost_inr": cost_inr, "eta_days": eta_days}
@@ -238,6 +346,8 @@ if "inv" not in st.session_state:
     st.session_state.inv = default_inventory()
 if "chat" not in st.session_state:
     st.session_state.chat = []          # [(role, content, tool_log)]
+if "last_transfer" not in st.session_state:
+    st.session_state.last_transfer = None
 
 with st.sidebar:
     st.header("⚙️ Setup")
@@ -263,12 +373,18 @@ with st.sidebar:
     if st.button("♻️ Reset everything"):
         st.session_state.inv = default_inventory()
         st.session_state.chat = []
+        st.session_state.last_transfer = None
         st.rerun()
 
 st.title("🚚 Supply Chain Disruption Agent")
 st.caption("An autonomous agent that detects stockout risk and rebalances inventory — with explainable, plain-English decisions.")
 
 st.subheader("📦 Live network inventory")
+st.plotly_chart(
+    inventory_map(st.session_state.inv, st.session_state.last_transfer),
+    use_container_width=True,
+    config={"displayModeBar": False},
+)
 st.dataframe(with_cover(st.session_state.inv), use_container_width=True, hide_index=True)
 
 st.subheader("💬 Ask the agent")
